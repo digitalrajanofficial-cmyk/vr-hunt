@@ -1,4 +1,4 @@
-name: VR GROUP GitHub-only hunt pipeline
+name: VR GitHub-only hunt pipeline
 
 on:
   workflow_dispatch:
@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   pipeline:
-    if: ${{ vars.ENABLE_HUNT == 'true' && vars.OPENCODE_VERSION != '' && vars.FREE_MODEL_POOL != '' }}
+    if: ${{ vars.ENABLE_VR == 'true' && vars.OPENCODE_VERSION != '' && vars.FREE_MODEL_POOL != '' }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
@@ -90,8 +90,8 @@ jobs:
           echo "SQLMAP_HOME=$RUNNER_TEMP/sqlmap" >> "$GITHUB_ENV"
       - name: Run passive scoped recon
         if: vars.ENABLE_RECON == 'true'
-        run: python -m hunt_pipeline run-recon --config config/program.json --output recon-input --passive-urls
-      - name: Restore VR GROUP state and knowledge
+        run: python -m hunt_pipeline run-recon --config config/programs/vr.json --output recon-input --passive-urls
+      - name: Restore VR state and knowledge
         uses: actions/cache/restore@v4
         with:
           path: |
@@ -101,19 +101,25 @@ jobs:
           key: hunt-state-vr-${{ github.run_id }}
           restore-keys: |
             hunt-state-vr-
+      - name: Install Claude-BugHunter skills for OpenCode
+        run: |
+          git clone --depth 1 https://github.com/elementalsouls/Claude-BugHunter.git /tmp/Claude-BugHunter
+          bash /tmp/Claude-BugHunter/scripts/install.sh --agents || true
+          echo "Installed skills: $(ls ~/.agents/skills 2>/dev/null | wc -l)"
+          ls ~/.agents/skills 2>/dev/null | head -n 20 || true
       - name: Install OpenCode
         run: npm install --global "opencode-ai@$OPENCODE_VERSION"
-      - name: Collect one scoped VR GROUP HEAD
+      - name: Collect one scoped VR HEAD
         run: |
           mkdir -p state artifacts/generated data
           if [ -f state/inventory.json ]; then
             cp state/inventory.json state/previous-inventory.json
           fi
-          python -m hunt_pipeline collect --config config/program.json --input inputs/seed.txt --output state/inventory.json --method HEAD --limit 1
+          python -m hunt_pipeline collect --config config/programs/vr.json --input inputs/vr.txt --output state/inventory.json --method HEAD --limit 1
       - name: Merge optional passive recon exports
         if: hashFiles('recon-input/*') != ''
-        run: python -m hunt_pipeline import-recon --config config/program.json --input-dir recon-input --base state/inventory.json --output state/inventory.json --limit 1000
-      - name: Compute VR GROUP inventory delta
+        run: python -m hunt_pipeline import-recon --config config/programs/vr.json --input-dir recon-input --base state/inventory.json --output state/inventory.json --limit 1000
+      - name: Compute VR inventory delta
         run: |
           if [ -f state/previous-inventory.json ]; then
             python -m hunt_pipeline delta --previous state/previous-inventory.json --current state/inventory.json --output state/delta.json
@@ -140,17 +146,17 @@ jobs:
       - name: Enrich inventory with tech/param signals
         if: hashFiles('state/inventory.json') != ''
         run: python -m hunt_pipeline enrich --inventory state/inventory.json --output state/inventory.json
-      - name: Build VR GROUP hypothesis prompt with RAG context
+      - name: Build VR hypothesis prompt with RAG context
         if: hashFiles('state/inventory.json') != ''
         run: python -m hunt_pipeline hypothesis-prompt --inventory state/inventory.json --delta state/delta.json --output state/hypothesis-prompt.txt --program vr --knowledge-base knowledge
-      - name: Generate VR GROUP candidate leads
+      - name: Generate VR candidate leads
         if: hashFiles('state/hypothesis-prompt.txt') != '' && steps.changes.outputs.changed == 'true' && steps.model-config.outputs.enabled == 'true'
         run: |
           python -m hunt_pipeline model-run --agent hypothesis --mode hypothesis --prompt state/hypothesis-prompt.txt --output artifacts/hypothesis-raw.json --inventory state/inventory.json --delta state/delta.json --program vr --rotation "$GITHUB_RUN_NUMBER" --attempts artifacts/model-attempts/hypothesis
           python -m hunt_pipeline import-leads --input artifacts/hypothesis-raw.json --inventory state/inventory.json --delta state/delta.json --program vr --output artifacts/generated/leads.json
-      - name: Ingest VR GROUP leads
+      - name: Ingest VR leads
         if: hashFiles('artifacts/generated/leads.json') != ''
-        run: python -m hunt_pipeline --db data/hunt.sqlite ingest --config config/program.json --input artifacts/generated/leads.json
+        run: python -m hunt_pipeline --db data/hunt.sqlite ingest --config config/programs/vr.json --input artifacts/generated/leads.json
       - name: Advance state for leads and verify
         if: hashFiles('artifacts/generated/leads.json') != ''
         env:
@@ -169,7 +175,7 @@ jobs:
           else
             OOB_FLAG=""
           fi
-          python -m hunt_pipeline verify --config config/program.json --input artifacts/generated/leads.json --output artifacts/verification.json $AUTH_FLAG $OOB_FLAG || true
+          python -m hunt_pipeline verify --config config/programs/vr.json --input artifacts/generated/leads.json --output artifacts/verification.json $AUTH_FLAG $OOB_FLAG || true
           if [ -f artifacts/verification.json ]; then
             python -m hunt_pipeline state-transition --program vr --event verified --base state || true
           fi
@@ -184,27 +190,27 @@ jobs:
               python -m hunt_pipeline oob-check --program vr --token "$token" --base state || true
             done
           fi
-      - name: Build VR GROUP triage prompt
+      - name: Build VR triage prompt
         if: hashFiles('artifacts/generated/leads.json') != ''
         run: |
           if python -c "import json; raise SystemExit(0 if len(json.load(open('artifacts/generated/leads.json'))) else 1)"; then
             python -m hunt_pipeline prompt --inbox artifacts/generated --output state/triage-prompt.txt
           fi
-      - name: Run first VR GROUP triage model
+      - name: Run first VR triage model
         if: hashFiles('state/triage-prompt.txt') != '' && steps.model-config.outputs.enabled == 'true'
         run: python -m hunt_pipeline model-run --agent triage --mode triage --prompt state/triage-prompt.txt --output artifacts/triage-a.json --rotation "$GITHUB_RUN_NUMBER" --attempts artifacts/model-attempts/triage-a
-      - name: Run second VR GROUP triage model
+      - name: Run second VR triage model
         if: hashFiles('state/triage-prompt.txt') != '' && steps.model-config.outputs.enabled == 'true'
         run: |
           exclude_model=$(python -c 'import json; print(json.load(open("artifacts/triage-a.json"))["model"])')
           python -m hunt_pipeline model-run --agent triage --mode triage --prompt state/triage-prompt.txt --output artifacts/triage-b.json --rotation "$GITHUB_RUN_NUMBER" --exclude "$exclude_model" --attempts artifacts/model-attempts/triage-b
-      - name: Build VR GROUP triage consensus
+      - name: Build VR triage consensus
         if: hashFiles('artifacts/triage-a.json') != '' && hashFiles('artifacts/triage-b.json') != ''
         run: python -m hunt_pipeline consensus --input artifacts/triage-a.json --input artifacts/triage-b.json --output artifacts/triage-consensus.json
-      - name: Store VR GROUP consensus verdicts
+      - name: Store VR consensus verdicts
         if: hashFiles('artifacts/triage-consensus.json') != ''
         run: python -m hunt_pipeline --db data/hunt.sqlite ingest-verdicts --input artifacts/triage-consensus.json --model consensus
-      - name: Store VR GROUP single-model fallback
+      - name: Store VR single-model fallback
         if: hashFiles('artifacts/triage-consensus.json') == '' && hashFiles('artifacts/triage-a.json') != ''
         run: python -m hunt_pipeline --db data/hunt.sqlite ingest-verdicts --input artifacts/triage-a.json --model free-pool-fallback
       - name: Update knowledge from triage
@@ -235,7 +241,7 @@ jobs:
         run: |
           python -m hunt_pipeline feedback-report --output artifacts/feedback-report.md --program vr || true
           python -m hunt_pipeline state-transition --program vr --event knowledge_updated --base state || true
-      - name: Save VR GROUP state and knowledge
+      - name: Save VR state and knowledge
         if: always()
         uses: actions/cache/save@v4
         with:
@@ -244,7 +250,7 @@ jobs:
             data
             knowledge
           key: hunt-state-vr-${{ github.run_id }}
-      - name: Upload VR GROUP review artifacts
+      - name: Upload VR review artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
