@@ -1,0 +1,89 @@
+name: Evidence-first model triage
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 */2 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: model-triage
+  cancel-in-progress: true
+
+jobs:
+  triage:
+    if: ${{ vars.FREE_MODEL_POOL != '' && vars.OPENCODE_VERSION != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      PYTHONPATH: src
+      FREE_MODEL_POOL: ${{ vars.FREE_MODEL_POOL }}
+      OPENCODE_VERSION: ${{ vars.OPENCODE_VERSION }}
+      OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Check model configuration
+        id: model-config
+        env:
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+        run: |
+          if [ -n "$OPENCODE_API_KEY" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install OpenCode
+        run: npm install --global "opencode-ai@$OPENCODE_VERSION"
+      - name: Ingest inbox leads
+        if: hashFiles('inbox/*.json') != ''
+        run: python -m hunt_pipeline --db data/hunt.sqlite ingest-dir --config-dir config/programs --input-dir inbox
+      - name: Build triage prompt
+        run: |
+          if ! compgen -G 'inbox/*.json' > /dev/null; then
+            echo "No inbox records; skipping."
+            exit 0
+          fi
+          python -m hunt_pipeline prompt --inbox inbox --output triage-prompt.txt
+      - name: Run first isolated triage agent
+        if: hashFiles('triage-prompt.txt') != '' && steps.model-config.outputs.enabled == 'true'
+        run: python -m hunt_pipeline model-run --agent triage --mode triage --prompt triage-prompt.txt --output triage-a.json --rotation "$GITHUB_RUN_NUMBER" --attempts artifacts/model-attempts/triage-a
+      - name: Run second isolated triage agent
+        if: hashFiles('triage-prompt.txt') != '' && steps.model-config.outputs.enabled == 'true'
+        run: |
+          exclude_model=$(python -c 'import json; print(json.load(open("triage-a.json"))["model"])')
+          python -m hunt_pipeline model-run --agent triage --mode triage --prompt triage-prompt.txt --output triage-b.json --rotation "$GITHUB_RUN_NUMBER" --exclude "$exclude_model" --attempts artifacts/model-attempts/triage-b
+      - name: Build model consensus
+        if: hashFiles('triage-a.json') != '' && hashFiles('triage-b.json') != ''
+        run: python -m hunt_pipeline consensus --input triage-a.json --input triage-b.json --output triage-consensus.json
+      - name: Store consensus verdicts
+        if: hashFiles('triage-consensus.json') != ''
+        run: python -m hunt_pipeline --db data/hunt.sqlite ingest-verdicts --input triage-consensus.json --model consensus
+      - name: Store single-model fallback
+        if: hashFiles('triage-consensus.json') == '' && hashFiles('triage-a.json') != ''
+        run: python -m hunt_pipeline --db data/hunt.sqlite ingest-verdicts --input triage-a.json --model free-pool-fallback
+      - name: Upload triage artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: triage-${{ github.run_id }}
+          path: |
+            triage-prompt.txt
+            triage-a.json
+            triage-b.json
+            triage-consensus.json
+            data/hunt.sqlite
+            artifacts/model-attempts
+          if-no-files-found: ignore
